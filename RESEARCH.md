@@ -172,3 +172,139 @@ patch:
 - AOSP `core/java/android/widget/EdgeEffect.java`
 - Bugzilla REST API, all open bugs matching `overscroll`
 - https://firefox-source-docs.mozilla.org/contributing/contribution_quickref.html
+
+---
+
+# Addendum: stretch vs. rubber-band, and why Chrome settles the argument
+
+Follow-up question: Android 12's own overscroll *stretches* the content rather than
+rubber-banding it. Shouldn't Firefox match the platform instead of copying its own
+desktop behaviour?
+
+**Yes — and it costs no more than the translate.** Chromium has already made exactly
+this decision, and its implementation is the design document we need.
+
+## Chromium runs both effects through one pipeline
+
+In `cc/trees/property_tree.cc` Chromium keeps two tiny functions side by side, fed by
+the same `ElasticOverscrollController` that drives macOS rubber-banding:
+
+```cpp
+// Desktop
+void ApplyElasticOverscrollTranslate(..., gfx::Transform* transform) {
+  transform->Translate(-elastic_overscroll.second.x(),
+                       -elastic_overscroll.second.y());
+}
+
+// Android
+void ApplyElasticOverscrollStretch(..., gfx::Transform* transform) {
+  const gfx::Vector2dF scale_factor(
+      1.f + std::abs(elastic_overscroll.second.x()) / scroller_size.width(),
+      1.f + std::abs(elastic_overscroll.second.y()) / scroller_size.height());
+
+  gfx::PointF pivot;                                  // stretch away from the far edge
+  if (elastic_overscroll.second.x() > 0.f) pivot.set_x(scroller_size.width());
+  if (elastic_overscroll.second.y() > 0.f) pivot.set_y(scroller_size.height());
+
+  // Translate(Pivot) -> Scale -> Translate(-Pivot)
+  transform->Translate(pivot.OffsetFromOrigin());
+  transform->Scale(scale_factor.x(), scale_factor.y());
+  transform->Translate(-pivot.OffsetFromOrigin());
+}
+```
+
+Selected by `#if BUILDFLAG(IS_ANDROID)` in `TransformTree::UpdateLocalTransform`.
+
+The critical point: **the Android stretch is an affine transform** — a scale anchored
+at the opposite edge — not a non-linear distortion shader. Content nearest the
+dragged edge moves most because it is furthest from the pivot. No new rendering
+primitive is required.
+
+## This maps one-to-one onto Gecko
+
+`AsyncPanZoomController::GetOverscrollTransform()`
+(`AsyncPanZoomController.cpp:5049`) is already Chrome's *translate* variant:
+
+```cpp
+// The overscroll effect is a simple translation by the overscroll offset.
+ParentLayerPoint overscrollOffset(-mX.GetOverscroll(), -mY.GetOverscroll());
+return AsyncTransformComponentMatrix().PostTranslate(overscrollOffset.x,
+                                                     overscrollOffset.y, 0);
+```
+
+It returns an `AsyncTransformComponentMatrix` (a 4x4 matrix), and everything the
+stretch needs is already in scope in that class:
+
+- `Metrics().GetCompositionBounds()` — the scroller size for the scale factor.
+- `AsyncTransformComponentMatrix::PostScale` — already used at
+  `AsyncPanZoomController.cpp:5468` for zoom.
+
+So the stretch is a second branch in one existing function, not a new pipeline.
+
+## Why "just let Android draw it" is the path that does not work
+
+The intuitive shortcut — call `RenderNode.stretch()` / `View.setRenderEffect()` and
+let the platform render the effect — is the one genuinely blocked route, for the
+reason in section 2: those APIs deform a **RenderNode**, and GeckoView's web content
+lives in a **SurfaceView** composited outside the View hierarchy.
+
+The only way to put web content inside a RenderNode is to switch GeckoView to
+`TextureView` (`GeckoView.java:377` — supported, but not the default because it costs
+latency, memory and power). Trading that for an animation would be rejected, and
+rightly.
+
+Chrome hit the same wall and drew the same conclusion: reimplement the stretch in
+your own compositor, where you already own the pixels.
+
+## Jetpack Compose / Kotlin are not involved
+
+- GeckoView is **Java**, not Kotlin — `GeckoView.java`, `GeckoSession.java`,
+  `OverscrollEdgeEffect.java`.
+- Compose's `androidx.compose.foundation.OverscrollEffect` only affects
+  Compose-drawn content. It cannot reach pixels Gecko composites into a Surface, for
+  exactly the same reason `RenderNode.stretch()` cannot.
+- The change is C++ in APZ, plus *deleting* Java. There is no port and no new UI
+  framework.
+
+## Known consequence to be ready to defend
+
+A translate can be undone for `position: fixed` content; a stretch cannot be undone
+by a simple inverse. Chromium therefore skips that correction entirely on Android
+(`property_tree.cc`, `UpdateLocalTransform`):
+
+```cpp
+// Android does a stretch effect instead of translation - since we cannot do
+// a simple translation to undo the root elastic overscroll effect -
+// on Android we simply skip this.
+#if !BUILDFLAG(IS_ANDROID)
+  if (node->should_undo_overscroll) {
+    UndoOverscroll(*node, position_adjustment, viewport_property_ids);
+  }
+#endif
+```
+
+So fixed headers stretch along with the page. That is the accepted trade, and it is
+an open spec question in Gecko too —
+[bug 1761049](https://bugzilla.mozilla.org/show_bug.cgi?id=1761049)
+"[css-overscroll] Whether to move position:fixed elements during overscrolling".
+Expect a reviewer to raise it.
+
+## Revised shape of the change
+
+1. Android stops using `WidgetOverscrollEffect` and uses `GenericOverscrollEffect`,
+   so APZ holds real overscroll state and runs the existing spring animation.
+2. `GetOverscrollTransform()` gains a `MOZ_WIDGET_ANDROID` branch producing the
+   pivot-anchored scale instead of the translate.
+3. The `EdgeEffect` glow path is retired — `OverscrollEdgeEffect.java`,
+   `GeckoSession.updateOverscrollOffset` / `updateOverscrollVelocity`, and the
+   `GeckoView.onDraw` call site.
+4. Resolve the interaction with the dynamic toolbar and with `position: fixed`
+   content.
+
+Steps 1 and 2 are small. Steps 3 and 4 are where the review effort lives.
+
+## Additional sources
+
+- Chromium `cc/trees/property_tree.cc`, `cc/input/scroll_elasticity_helper.{h,cc}`
+  (`chromium/src` `main`)
+- AOSP `core/java/android/widget/EdgeEffect.java`, `draw(Canvas)` stretch branch
